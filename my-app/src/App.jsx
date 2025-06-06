@@ -23,23 +23,48 @@ function App() {
   const wordTimingsRef = useRef([]);
   const audioQueueRef = useRef([]);
   const isPlayingRef = useRef(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [error, setError] = useState(null);
+  const audioElementRef = useRef(new Audio());
 
   useEffect(() => {
-    // Connect to Socket.IO server
-    socketRef.current = io('http://localhost:5000');
+    // Initialize socket connection
+    const socket = io('http://localhost:5000', {
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      timeout: 10000
+    });
 
-    socketRef.current.on('connect', () => {
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
       console.log('Connected to server');
+      setIsConnected(true);
     });
 
-    socketRef.current.on('ttsProgress', (data) => {
-      setTtsProgress(data.progress);
-      setTtsStatus(data.status);
+    socket.on('disconnect', () => {
+      console.log('Disconnected from server');
+      setIsConnected(false);
+      stopReading();
     });
 
-    socketRef.current.on('audioChunk', (data) => {
+    socket.on('connect_error', (error) => {
+      console.error('Connection error:', error);
+      setIsConnected(false);
+    });
+
+    socket.on('ttsError', (error) => {
+      console.error('TTS Error:', error);
+      setError(error);
+      stopReading();
+    });
+
+    socket.on('audioChunk', (data) => {
+      if (!isPlayingRef.current) return;
+      
       // Convert base64 to blob
-      const byteCharacters = atob(data.chunk);
+      const byteCharacters = atob(data.audioContent);
       const byteNumbers = new Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
         byteNumbers[i] = byteCharacters.charCodeAt(i);
@@ -47,42 +72,24 @@ function App() {
       const byteArray = new Uint8Array(byteNumbers);
       const blob = new Blob([byteArray], { type: data.type });
       
-      // Add to audio queue
       audioQueueRef.current.push({
         blob,
         index: data.index,
-        duration: data.duration,
-        wordCount: data.wordCount
+        duration: data.duration
       });
 
-      // If this is the first chunk and we're ready to play, start playing
-      if (data.index === 0 && isPlayingRef.current) {
+      if (audioQueueRef.current.length === 1) {
         playNextChunk();
       }
     });
 
-    socketRef.current.on('ttsComplete', () => {
-      setIsGeneratingAudio(false);
-      // Only start playing if we haven't started yet and have chunks
-      if (isPlayingRef.current && audioQueueRef.current.length > 0 && !audioRef.current) {
-        playNextChunk();
-      }
-    });
-
-    socketRef.current.on('ttsError', (error) => {
-      console.error('TTS error:', error);
-      setIsPlaying(false);
-      setIsGeneratingAudio(false);
-      isPlayingRef.current = false;
+    socket.on('ttsComplete', () => {
+      console.log('TTS conversion completed');
     });
 
     return () => {
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
-      if (audioRef.current) {
-        audioRef.current.pause();
-      }
+      stopReading();
+      socket.disconnect();
     };
   }, []);
 
@@ -178,83 +185,91 @@ function App() {
     }
   };
 
-  const startReading = () => {
-    if (!text) return;
-    
-    // Reset states
-    setIsPlaying(true);
-    isPlayingRef.current = true;
-    setCurrentWord('');
-    setIsGeneratingAudio(true);
-    setTtsProgress(0);
-    setTtsStatus('Starting...');
-    audioQueueRef.current = []; // Clear any existing queue
-    
-    // Stop any existing audio
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
+  const startReading = async () => {
+    if (!text || !socketRef.current) return;
 
-    // Request text-to-speech conversion
-    socketRef.current.emit('convertToSpeech', { text });
+    try {
+      setError(null);
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      setCurrentWord('');
+      
+      const audio = audioElementRef.current;
+      audio.pause();
+      audio.currentTime = 0;
+      audio.src = '';
+      audioQueueRef.current = [];
+
+      socketRef.current.emit('convertToSpeech', { text });
+    } catch (error) {
+      console.error('Error starting reading:', error);
+      setError('Failed to start reading');
+      stopReading();
+    }
   };
 
   const stopReading = () => {
+    const audio = audioElementRef.current;
+    audio.pause();
+    audio.currentTime = 0;
+    audio.src = '';
+    audioQueueRef.current = [];
     setIsPlaying(false);
     isPlayingRef.current = false;
     setCurrentWord('');
-    setIsGeneratingAudio(false);
-    
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    
-    // Clear the audio queue
-    audioQueueRef.current = [];
   };
 
   const playNextChunk = () => {
     if (audioQueueRef.current.length === 0) {
-      setIsPlaying(false);
-      isPlayingRef.current = false;
-      setCurrentWord('');
+      stopReading();
       return;
     }
 
-    const nextChunk = audioQueueRef.current.shift();
+    const nextChunk = audioQueueRef.current[0];
     const audioUrl = URL.createObjectURL(nextChunk.blob);
-    const audio = new Audio(audioUrl);
-    audioRef.current = audio;
+    const audio = audioElementRef.current;
+    
+    // Reset audio element
+    audio.pause();
+    audio.currentTime = 0;
+    audio.src = audioUrl;
 
     // Calculate word timings for this chunk
-    const chunkWords = text.split(/\s+/).slice(
-      nextChunk.index * 50,
-      (nextChunk.index + 1) * 50
-    );
+    const allWords = text.split(/\s+/);
+    const startIndex = nextChunk.index * 50;
+    const endIndex = Math.min(startIndex + 50, allWords.length);
+    const chunkWords = allWords.slice(startIndex, endIndex);
 
-    const wordScores = chunkWords.map(word => {
-      let score = word.length;
-      if (/[.,!?;:]/.test(word)) score += 2;
-      if (/\d/.test(word)) score += 1;
-      if (/[A-Z]/.test(word)) score += 1;
-      return score;
+    // Calculate word durations based on word length and complexity
+    const wordDurations = chunkWords.map(word => {
+      let duration = word.length * 0.1;
+      if (/[.,!?;:]/.test(word)) duration += 0.3;
+      if (/\d/.test(word)) duration += 0.2;
+      if (/[A-Z]/.test(word)) duration += 0.1;
+      if (word.length > 8) duration += 0.2;
+      return duration;
     });
 
-    const totalScore = wordScores.reduce((sum, score) => sum + score, 0);
+    const totalDuration = wordDurations.reduce((sum, duration) => sum + duration, 0);
+    const scaleFactor = nextChunk.duration / totalDuration;
     let currentTime = 0;
 
     wordTimingsRef.current = chunkWords.map((word, index) => {
-      const wordDuration = (wordScores[index] / totalScore) * nextChunk.duration;
+      const duration = wordDurations[index] * scaleFactor;
       const startTime = currentTime;
-      currentTime += wordDuration;
+      currentTime += duration;
       return {
         word,
-        index: nextChunk.index * 50 + index,
+        index: startIndex + index,
         startTime,
         endTime: currentTime
       };
+    });
+
+    wordTimingsRef.current.forEach((timing, index) => {
+      if (index < wordTimingsRef.current.length - 1) {
+        timing.endTime += 0.05;
+      }
     });
 
     audio.addEventListener('timeupdate', () => {
@@ -266,21 +281,25 @@ function App() {
       );
 
       if (currentWordIndex !== -1) {
-        const globalWordIndex = nextChunk.index * 50 + currentWordIndex;
+        const globalWordIndex = wordTimingsRef.current[currentWordIndex].index;
         setCurrentWord(globalWordIndex);
       }
     });
 
-    audio.onended = () => {
+    audio.addEventListener('ended', () => {
       URL.revokeObjectURL(audioUrl);
+      audioQueueRef.current.shift(); // Remove the played chunk
+      
       if (audioQueueRef.current.length > 0 && isPlayingRef.current) {
-        playNextChunk();
+        setTimeout(() => {
+          if (isPlayingRef.current) {
+            playNextChunk();
+          }
+        }, 200);
       } else {
-        setIsPlaying(false);
-        isPlayingRef.current = false;
-        setCurrentWord('');
+        stopReading();
       }
-    };
+    });
 
     audio.play().catch(error => {
       console.error('Error playing audio:', error);
@@ -306,6 +325,33 @@ function App() {
       cleanup();
     };
   }, [currentFileId]);
+
+  // Add a function to render the text with highlighting
+  const renderText = () => {
+    if (!text) return null;
+
+    const words = text.split(/\s+/);
+    return (
+      <div className="text-content">
+        {words.map((word, index) => (
+          <span
+            key={index}
+            className={`word ${index === currentWord ? 'highlighted' : ''}`}
+            ref={el => {
+              if (el && index === currentWord) {
+                el.scrollIntoView({
+                  behavior: 'smooth',
+                  block: 'center'
+                });
+              }
+            }}
+          >
+            {word}{' '}
+          </span>
+        ))}
+      </div>
+    );
+  };
 
   return (
     <>
@@ -396,16 +442,7 @@ function App() {
             </div>
           )}
           
-          <div className="text-display">
-            {text.split(/\s+/).map((word, index) => (
-              <span
-                key={index}
-                className={`word ${index === currentWord ? 'highlight' : ''}`}
-              >
-                {word}{' '}
-              </span>
-            ))}
-          </div>
+          {renderText()}
         </div>
       )}
     </>

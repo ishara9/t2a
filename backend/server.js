@@ -172,131 +172,105 @@ const textToSpeech = async (text, socket) => {
     const concurrencyLimit = 5;
     const results = [];
 
-    // Process first chunk immediately to start playback faster
+    // Process first chunk immediately
     const firstChunk = chunks[0];
     const firstOutputFile = path.join(tempDir, 'chunk_0.mp3');
     
     try {
-      const firstChunkResult = await new Promise((resolve, reject) => {
-        const tts = spawn('gtts-cli', [
-          firstChunk,
-          '--output', firstOutputFile
-        ]);
+      await new Promise((resolve, reject) => {
+        const tts = spawn('gtts-cli', [firstChunk, '--output', firstOutputFile]);
+        socket.ttsProcess = tts;
 
-        tts.stderr.on('data', (data) => {
-          console.log(`TTS stderr: ${data}`);
-        });
-
-        tts.on('close', async (code) => {
+        tts.on('close', (code) => {
           if (code !== 0) {
-            reject(new Error(`TTS process exited with code ${code}`));
+            reject(new Error('Failed to convert first chunk to speech'));
             return;
           }
+          resolve();
+        });
 
-          try {
-            const probeData = await ffprobe(firstOutputFile);
-            const duration = probeData.format.duration;
-            const audioBuffer = await fs.promises.readFile(firstOutputFile);
-            const base64Audio = audioBuffer.toString('base64');
-            fs.unlinkSync(firstOutputFile);
-
-            resolve({
-              audioContent: base64Audio,
-              duration,
-              index: 0
-            });
-          } catch (error) {
-            reject(error);
-          }
+        tts.on('error', (err) => {
+          reject(err);
         });
       });
 
-      // Send first chunk immediately
-      socket.emit('audioChunk', {
-        chunk: firstChunkResult.audioContent,
-        type: 'audio/mp3',
-        duration: firstChunkResult.duration,
-        index: 0,
-        wordCount: words.slice(0, 50).length
-      });
+      const audioBuffer = await fs.promises.readFile(firstOutputFile);
+      const base64Audio = audioBuffer.toString('base64');
+      const probeData = await ffprobe(firstOutputFile);
+      const duration = probeData.format.duration;
 
-      results.push(firstChunkResult);
-      processedChunks++;
-      socket.emit('ttsProgress', { 
-        progress: Math.round((processedChunks / totalChunks) * 100),
-        status: `Processing remaining chunks...`
-      });
-    } catch (error) {
-      console.error('Error processing first chunk:', error);
-      socket.emit('ttsError', { error: error.message });
-      return;
-    }
-
-    // Process remaining chunks in parallel
-    for (let i = 1; i < chunks.length; i += concurrencyLimit) {
-      const chunkPromises = chunks.slice(i, i + concurrencyLimit).map(async (chunk, index) => {
-        const chunkIndex = i + index;
-        const outputFile = path.join(tempDir, `chunk_${chunkIndex}.mp3`);
-
-        return new Promise((resolve, reject) => {
-          const tts = spawn('gtts-cli', [
-            chunk,
-            '--output', outputFile
-          ]);
-
-          tts.stderr.on('data', (data) => {
-            console.log(`TTS stderr: ${data}`);
-          });
-
-          tts.on('close', async (code) => {
-            if (code !== 0) {
-              reject(new Error(`TTS process exited with code ${code}`));
-              return;
-            }
-
-            try {
-              const probeData = await ffprobe(outputFile);
-              const duration = probeData.format.duration;
-              const audioBuffer = await fs.promises.readFile(outputFile);
-              const base64Audio = audioBuffer.toString('base64');
-              fs.unlinkSync(outputFile);
-
-              resolve({
-                audioContent: base64Audio,
-                duration,
-                index: chunkIndex,
-                wordCount: words.slice(chunkIndex * 50, (chunkIndex + 1) * 50).length
-              });
-            } catch (error) {
-              reject(error);
-            }
-          });
-        });
-      });
-
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-
-      // Send chunks to client as soon as they're ready
-      for (const result of chunkResults) {
+      if (socket.connected) {
         socket.emit('audioChunk', {
-          chunk: result.audioContent,
-          type: 'audio/mp3',
-          duration: result.duration,
-          index: result.index,
-          wordCount: result.wordCount
+          index: 0,
+          audioContent: base64Audio,
+          type: 'audio/mpeg',
+          duration: duration
         });
       }
 
-      processedChunks += chunkPromises.length;
-      const progress = Math.round((processedChunks / totalChunks) * 100);
-      socket.emit('ttsProgress', { 
-        progress, 
-        status: `Processing chunk ${processedChunks} of ${totalChunks}...` 
-      });
-    }
+      // Process remaining chunks
+      for (let i = 1; i < chunks.length; i++) {
+        if (!socket.connected) break;
 
-    socket.emit('ttsComplete');
+        const chunk = chunks[i];
+        const outputFile = path.join(tempDir, `chunk_${i}.mp3`);
+        
+        try {
+          await new Promise((resolve, reject) => {
+            const tts = spawn('gtts-cli', [chunk, '--output', outputFile]);
+            socket.ttsProcess = tts;
+            
+            tts.on('close', (code) => {
+              if (code !== 0) {
+                reject(new Error(`Failed to convert chunk ${i} to speech`));
+                return;
+              }
+              resolve();
+            });
+
+            tts.on('error', (err) => {
+              reject(err);
+            });
+          });
+
+          const audioBuffer = await fs.promises.readFile(outputFile);
+          const base64Audio = audioBuffer.toString('base64');
+          const probeData = await ffprobe(outputFile);
+          const duration = probeData.format.duration;
+
+          if (socket.connected) {
+            socket.emit('audioChunk', {
+              index: i,
+              audioContent: base64Audio,
+              type: 'audio/mpeg',
+              duration: duration
+            });
+          }
+        } catch (error) {
+          console.error(`Error processing chunk ${i}:`, error);
+          if (socket.connected) {
+            socket.emit('ttsError', `Error processing chunk ${i}`);
+          }
+          break;
+        }
+      }
+
+      if (socket.connected) {
+        socket.emit('ttsComplete');
+      }
+    } catch (error) {
+      console.error('Error processing audio chunks:', error);
+      if (socket.connected) {
+        socket.emit('ttsError', 'Error processing audio chunks');
+      }
+    } finally {
+      // Clean up temp files
+      try {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+      } catch (error) {
+        console.error('Error cleaning up temp files:', error);
+      }
+    }
   } catch (error) {
     console.error('Error in textToSpeech:', error);
     socket.emit('ttsError', { error: error.message });
@@ -307,17 +281,140 @@ const textToSpeech = async (text, socket) => {
 io.on('connection', (socket) => {
   console.log('Client connected');
 
-  socket.on('convertToSpeech', async (data) => {
-    try {
-      await textToSpeech(data.text, socket);
-    } catch (error) {
-      console.error('Error in convertToSpeech:', error);
-      socket.emit('ttsError', { error: error.message });
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log('Client disconnected');
+    // Clean up any ongoing processes
+    if (socket.ttsProcess) {
+      socket.ttsProcess.kill();
     }
   });
 
-  socket.on('disconnect', () => {
-    console.log('Client disconnected');
+  // Handle text-to-speech conversion
+  socket.on('convertToSpeech', async (data) => {
+    try {
+      const { text } = data;
+      if (!text) {
+        socket.emit('ttsError', 'No text provided');
+        return;
+      }
+
+      // Create temp directory for this session
+      const tempDir = path.join(__dirname, 'temp', socket.id);
+      await fs.promises.mkdir(tempDir, { recursive: true });
+
+      // Split text into chunks
+      const words = text.split(/\s+/);
+      const chunks = [];
+      for (let i = 0; i < words.length; i += 50) {
+        chunks.push(words.slice(i, i + 50).join(' '));
+      }
+
+      // Process first chunk immediately
+      const firstChunk = chunks[0];
+      const firstOutputFile = path.join(tempDir, 'chunk_0.mp3');
+      
+      try {
+        await new Promise((resolve, reject) => {
+          const tts = spawn('gtts-cli', [firstChunk, '--output', firstOutputFile]);
+          socket.ttsProcess = tts;
+
+          tts.on('close', (code) => {
+            if (code !== 0) {
+              reject(new Error('Failed to convert first chunk to speech'));
+              return;
+            }
+            resolve();
+          });
+
+          tts.on('error', (err) => {
+            reject(err);
+          });
+        });
+
+        const audioBuffer = await fs.promises.readFile(firstOutputFile);
+        const base64Audio = audioBuffer.toString('base64');
+        const probeData = await ffprobe(firstOutputFile);
+        const duration = probeData.format.duration;
+
+        if (socket.connected) {
+          socket.emit('audioChunk', {
+            index: 0,
+            audioContent: base64Audio,
+            type: 'audio/mpeg',
+            duration: duration
+          });
+        }
+
+        // Process remaining chunks
+        for (let i = 1; i < chunks.length; i++) {
+          if (!socket.connected) break;
+
+          const chunk = chunks[i];
+          const outputFile = path.join(tempDir, `chunk_${i}.mp3`);
+          
+          try {
+            await new Promise((resolve, reject) => {
+              const tts = spawn('gtts-cli', [chunk, '--output', outputFile]);
+              socket.ttsProcess = tts;
+              
+              tts.on('close', (code) => {
+                if (code !== 0) {
+                  reject(new Error(`Failed to convert chunk ${i} to speech`));
+                  return;
+                }
+                resolve();
+              });
+
+              tts.on('error', (err) => {
+                reject(err);
+              });
+            });
+
+            const audioBuffer = await fs.promises.readFile(outputFile);
+            const base64Audio = audioBuffer.toString('base64');
+            const probeData = await ffprobe(outputFile);
+            const duration = probeData.format.duration;
+
+            if (socket.connected) {
+              socket.emit('audioChunk', {
+                index: i,
+                audioContent: base64Audio,
+                type: 'audio/mpeg',
+                duration: duration
+              });
+            }
+          } catch (error) {
+            console.error(`Error processing chunk ${i}:`, error);
+            if (socket.connected) {
+              socket.emit('ttsError', `Error processing chunk ${i}`);
+            }
+            break;
+          }
+        }
+
+        if (socket.connected) {
+          socket.emit('ttsComplete');
+        }
+      } catch (error) {
+        console.error('Error processing audio chunks:', error);
+        if (socket.connected) {
+          socket.emit('ttsError', 'Error processing audio chunks');
+        }
+      } finally {
+        // Clean up temp files
+        try {
+          await fs.promises.rm(tempDir, { recursive: true, force: true });
+        } catch (error) {
+          console.error('Error cleaning up temp files:', error);
+        }
+      }
+    } catch (error) {
+      console.error('Error in textToSpeech:', error);
+      if (socket.connected) {
+        socket.emit('ttsError', 'Error in text-to-speech conversion');
+      }
+    }
   });
 });
 

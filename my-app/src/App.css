@@ -126,12 +126,37 @@
   overflow-y: auto;
 }
 
+.text-content {
+  max-width: 800px;
+  margin: 20px auto;
+  padding: 20px;
+  line-height: 1.6;
+  font-size: 18px;
+  text-align: left;
+  background-color: #f8f9fa;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  max-height: 70vh;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
 .word {
   display: inline-block;
-  margin: 2px;
-  padding: 2px;
-  border-radius: 2px;
-  transition: background-color 0.2s;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+  margin: 0 2px;
+}
+
+.word.highlighted {
+  background-color: #ffd700 !important;
+  color: #000 !important;
+  font-weight: bold !important;
+  box-shadow: 0 0 8px rgba(255, 215, 0, 0.8) !important;
+  transform: scale(1.05);
+  z-index: 1;
+  position: relative;
 }
 
 .word.highlight {
@@ -223,4 +248,22 @@
 .chapter-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Ensure the highlighted word is always visible */
+.word.highlighted {
+  scroll-margin: 100px;
+}
+
+/* Debug styles to verify highlighting */
+.word.highlighted::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  border: 2px solid #ff4500;
+  border-radius: 4px;
+  pointer-events: none;
 }
